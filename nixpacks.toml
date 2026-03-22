@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = ["npm ci --production"]
+
+[phases.build]
+cmds = ["echo 'Build already included in dist/'"]
+
+[start]
+cmd = "node dist/index.cjs"
