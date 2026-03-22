@@ -28,6 +28,11 @@ export default function ChatPage() {
     queryKey: ["/api/chat/history"],
   });
 
+  const { data: coachStatus } = useQuery<{ mode: string; label: string }>({
+    queryKey: ["/api/coach/status"],
+    queryFn: () => apiRequest("GET", "/api/coach/status").then(r => r.json()),
+  });
+
   const [localMessages, setLocalMessages] = useState<ChatMessage[]>([]);
   const allMessages = [...history, ...localMessages];
 
@@ -86,7 +91,14 @@ export default function ChatPage() {
             <Bot className="w-5 h-5" />
           </div>
           <div>
-            <h2 className="text-lg font-semibold">Coach IA</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="text-lg font-semibold">Coach IA</h2>
+              {coachStatus?.mode === "ai" ? (
+                <Badge variant="default" className="bg-emerald-600 hover:bg-emerald-600 text-xs">{coachStatus.label}</Badge>
+              ) : coachStatus?.mode === "rules" ? (
+                <Badge variant="outline" className="text-xs">{coachStatus.label}</Badge>
+              ) : null}
+            </div>
             <p className="text-xs text-muted-foreground">
               Discute avec ton coach pour adapter ton plan d'entraînement
             </p>

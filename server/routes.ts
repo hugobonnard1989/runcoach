@@ -1,9 +1,58 @@
 import type { Express } from "express";
 import type { Server } from "http";
+import fs from "fs";
+import path from "path";
 import { storage } from "./storage";
 import { insertActivitySchema, insertWeightEntrySchema, insertUserProfileSchema, insertTrainingPlanSchema } from "@shared/schema";
 
+// =================== CONFIG STORE ===================
+const CONFIG_PATH = path.join(process.cwd(), "data", "config.json");
+
+interface AppConfig {
+  stravaClientId?: string;
+  stravaClientSecret?: string;
+  perplexityApiKey?: string;
+}
+
+function loadConfig(): AppConfig {
+  try {
+    if (fs.existsSync(CONFIG_PATH)) {
+      return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    }
+  } catch (e) { /* ignore */ }
+  return {};
+}
+
+function saveConfig(config: AppConfig): void {
+  const dir = path.dirname(CONFIG_PATH);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
 export async function registerRoutes(server: Server, app: Express) {
+  // =================== CONFIG API ===================
+  app.get("/api/config", (_req, res) => {
+    const config = loadConfig();
+    const masked: Record<string, string> = {};
+    if (config.stravaClientId) masked.stravaClientId = config.stravaClientId;
+    if (config.stravaClientSecret) masked.stravaClientSecret = config.stravaClientSecret.length > 4 ? "••••" + config.stravaClientSecret.slice(-4) : config.stravaClientSecret;
+    if (config.perplexityApiKey) masked.perplexityApiKey = config.perplexityApiKey.length > 4 ? "••••" + config.perplexityApiKey.slice(-4) : config.perplexityApiKey;
+    res.json(masked);
+  });
+
+  app.put("/api/config", (req, res) => {
+    const { stravaClientId, stravaClientSecret, perplexityApiKey } = req.body;
+    const existing = loadConfig();
+    const updated: AppConfig = { ...existing };
+    if (stravaClientId !== undefined) updated.stravaClientId = stravaClientId;
+    if (stravaClientSecret !== undefined && !stravaClientSecret.startsWith("••••")) updated.stravaClientSecret = stravaClientSecret;
+    if (perplexityApiKey !== undefined && !perplexityApiKey.startsWith("••••")) updated.perplexityApiKey = perplexityApiKey;
+    saveConfig(updated);
+    res.json({ success: true });
+  });
+
   // =================== PROFILE ===================
   app.get("/api/profile", async (_req, res) => {
     const profile = await storage.getProfile();
@@ -182,8 +231,79 @@ export async function registerRoutes(server: Server, app: Express) {
     res.json({ success: true, message: "Garmin connected" });
   });
 
-  // =================== COACH CHAT (Rule-Based) ===================
+  // =================== COACH CHAT (Rule-Based + Perplexity) ===================
   const chatHistory: Array<{ role: string; content: string }> = [];
+
+  async function callPerplexityCoach(
+    message: string,
+    profile: any,
+    plan: any[],
+    activities: any[],
+    apiKey: string
+  ): Promise<CoachResponse | null> {
+    try {
+      const now = new Date();
+      const today = now.toISOString().split("T")[0];
+      const upcomingSessions = plan.filter(s => s.date >= today && !s.completed).slice(0, 5);
+      const recentActivities = activities.slice(0, 5).map(a =>
+        `${a.date}: ${a.type} ${a.distanceKm}km en ${a.durationMinutes}min (allure ${a.avgPaceMinKm || "?"}/km, ressenti ${a.feeling || "?"})`
+      ).join("\n");
+      const upcomingPlan = upcomingSessions.map(s =>
+        `${s.date}: ${s.sessionType} - ${s.description}${s.targetDistanceKm ? ` (${s.targetDistanceKm}km)` : ""}`
+      ).join("\n");
+
+      const systemPrompt = `Tu es un coach de course à pied expérimenté et bienveillant. Tu parles en français.
+Profil du coureur :
+- Nom : ${profile?.name || "l'athlète"}
+- Âge : ${profile?.age || "inconnu"}, Poids : ${profile?.weight || "inconnu"}kg
+- Niveau : ${profile?.fitnessLevel || "intermédiaire"}
+- Objectif : ${profile?.targetRace || "non défini"} le ${profile?.targetDate || "?"}, temps visé : ${profile?.targetTime || "?"}
+- Blessures/notes : ${profile?.injuryNotes || "aucune"}
+
+Activités récentes :
+${recentActivities || "Aucune activité récente"}
+
+Prochaines séances prévues :
+${upcomingPlan || "Aucune séance planifiée"}
+
+Réponds de manière concise, personnalisée et motivante. Utilise des émojis avec parcimonie. Si on te demande de modifier le plan, explique ce que tu recommandes.`;
+
+      const messages = [
+        { role: "system", content: systemPrompt },
+        ...chatHistory.slice(-10).map(m => ({ role: m.role, content: m.content })),
+        { role: "user", content: message },
+      ];
+
+      const response = await fetch("https://api.perplexity.ai/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: "sonar",
+          messages,
+        }),
+      });
+
+      if (!response.ok) return null;
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) return null;
+      return { message: content };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  app.get("/api/coach/status", (_req, res) => {
+    const apiKey = process.env.PERPLEXITY_API_KEY || loadConfig().perplexityApiKey;
+    if (apiKey) {
+      res.json({ mode: "ai", label: "Perplexity Sonar" });
+    } else {
+      res.json({ mode: "rules", label: "Coach automatique" });
+    }
+  });
 
   app.get("/api/chat/history", (_req, res) => {
     res.json(chatHistory);
@@ -198,7 +318,17 @@ export async function registerRoutes(server: Server, app: Express) {
     const activities = await storage.getActivities(10);
 
     chatHistory.push({ role: "user", content: message });
-    const response = generateCoachResponse(message, profile, plan, activities);
+
+    // Try Perplexity first if API key exists
+    const perplexityKey = process.env.PERPLEXITY_API_KEY || loadConfig().perplexityApiKey;
+    let response: CoachResponse;
+    if (perplexityKey) {
+      const aiResponse = await callPerplexityCoach(message, profile, plan, activities, perplexityKey);
+      response = aiResponse || generateCoachResponse(message, profile, plan, activities);
+    } else {
+      response = generateCoachResponse(message, profile, plan, activities);
+    }
+
     chatHistory.push({ role: "assistant", content: response.message });
 
     // Apply plan modifications if any
@@ -220,8 +350,8 @@ export async function registerRoutes(server: Server, app: Express) {
   let stravaAccessToken: string | null = process.env.STRAVA_ACCESS_TOKEN || null;
   let stravaRefreshToken: string | null = process.env.STRAVA_REFRESH_TOKEN || null;
 
-  app.get("/api/strava/status", async (_req, res) => {
-    const clientId = process.env.STRAVA_CLIENT_ID;
+  app.get("/api/strava/status", async (req, res) => {
+    const clientId = process.env.STRAVA_CLIENT_ID || loadConfig().stravaClientId;
     const configured = !!clientId;
 
     if (!configured) {
@@ -260,8 +390,8 @@ export async function registerRoutes(server: Server, app: Express) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          client_id: process.env.STRAVA_CLIENT_ID,
-          client_secret: process.env.STRAVA_CLIENT_SECRET,
+          client_id: process.env.STRAVA_CLIENT_ID || loadConfig().stravaClientId,
+          client_secret: process.env.STRAVA_CLIENT_SECRET || loadConfig().stravaClientSecret,
           code,
           grant_type: "authorization_code",
         }),
@@ -356,14 +486,17 @@ export async function registerRoutes(server: Server, app: Express) {
   });
 
   async function refreshStravaToken(): Promise<boolean> {
-    if (!stravaRefreshToken || !process.env.STRAVA_CLIENT_ID || !process.env.STRAVA_CLIENT_SECRET) return false;
+    const cfg = loadConfig();
+    const clientId = process.env.STRAVA_CLIENT_ID || cfg.stravaClientId;
+    const clientSecret = process.env.STRAVA_CLIENT_SECRET || cfg.stravaClientSecret;
+    if (!stravaRefreshToken || !clientId || !clientSecret) return false;
     try {
       const response = await fetch("https://www.strava.com/oauth/token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          client_id: process.env.STRAVA_CLIENT_ID,
-          client_secret: process.env.STRAVA_CLIENT_SECRET,
+          client_id: clientId,
+          client_secret: clientSecret,
           refresh_token: stravaRefreshToken,
           grant_type: "refresh_token",
         }),

@@ -9,7 +9,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { Watch, ExternalLink, CheckCircle2, AlertCircle, User, Target, RefreshCw, Loader2 } from "lucide-react";
+import { Watch, ExternalLink, CheckCircle2, AlertCircle, User, Target, RefreshCw, Loader2, Key } from "lucide-react";
 import { SiStrava } from "react-icons/si";
 import type { UserProfile } from "@shared/schema";
 import { useToast } from "@/hooks/use-toast";
@@ -27,6 +27,39 @@ export default function SettingsPage() {
   const { data: stravaStatus, isLoading: stravaLoading } = useQuery({
     queryKey: ["/api/strava/status"],
     queryFn: () => apiRequest("GET", "/api/strava/status").then(r => r.json()),
+  });
+
+  const { data: apiConfig } = useQuery({
+    queryKey: ["/api/config"],
+    queryFn: () => apiRequest("GET", "/api/config").then(r => r.json()),
+  });
+
+  const [configForm, setConfigForm] = useState({
+    stravaClientId: "",
+    stravaClientSecret: "",
+    perplexityApiKey: "",
+  });
+  const [configLoaded, setConfigLoaded] = useState(false);
+
+  if (apiConfig && !configLoaded) {
+    setConfigForm({
+      stravaClientId: apiConfig.stravaClientId || "",
+      stravaClientSecret: apiConfig.stravaClientSecret || "",
+      perplexityApiKey: apiConfig.perplexityApiKey || "",
+    });
+    setConfigLoaded(true);
+  }
+
+  const saveConfigMutation = useMutation({
+    mutationFn: async (data: any) => {
+      await apiRequest("PUT", "/api/config", data);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/config"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/strava/status"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/coach/status"] });
+      toast({ title: "Configuration sauvegardée" });
+    },
   });
 
   const { toast } = useToast();
@@ -116,6 +149,81 @@ export default function SettingsPage() {
         <h2 className="text-lg font-semibold">Réglages</h2>
         <p className="text-sm text-muted-foreground">Profil, objectifs et connexions</p>
       </div>
+
+      {/* API Configuration */}
+      <Card data-testid="card-api-config">
+        <CardHeader className="pb-3">
+          <div className="flex items-center gap-2">
+            <Key className="w-4 h-4" />
+            <CardTitle className="text-sm font-medium">Configuration API</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div>
+            <span className="text-xs font-medium">Strava API</span>
+            <p className="text-xs text-muted-foreground mb-2">
+              Crée une application sur{" "}
+              <a href="https://www.strava.com/settings/api" target="_blank" rel="noopener noreferrer" className="text-primary underline">
+                strava.com/settings/api
+              </a>{" "}
+              pour obtenir tes clés.
+            </p>
+            <div className="grid grid-cols-1 gap-3">
+              <div>
+                <Label className="text-xs">Client ID</Label>
+                <Input
+                  value={configForm.stravaClientId}
+                  onChange={e => setConfigForm(f => ({ ...f, stravaClientId: e.target.value }))}
+                  placeholder="12345"
+                  data-testid="input-config-strava-id"
+                />
+              </div>
+              <div>
+                <Label className="text-xs">Client Secret</Label>
+                <Input
+                  type="password"
+                  value={configForm.stravaClientSecret}
+                  onChange={e => setConfigForm(f => ({ ...f, stravaClientSecret: e.target.value }))}
+                  placeholder="••••••••"
+                  data-testid="input-config-strava-secret"
+                />
+              </div>
+            </div>
+          </div>
+
+          <Separator />
+
+          <div>
+            <span className="text-xs font-medium">Coach IA Perplexity</span>
+            <p className="text-xs text-muted-foreground mb-2">
+              Obtiens une clé API sur{" "}
+              <a href="https://docs.perplexity.ai/" target="_blank" rel="noopener noreferrer" className="text-primary underline">
+                docs.perplexity.ai
+              </a>{" "}
+              pour activer le coach IA.
+            </p>
+            <div>
+              <Label className="text-xs">Clé API Perplexity</Label>
+              <Input
+                type="password"
+                value={configForm.perplexityApiKey}
+                onChange={e => setConfigForm(f => ({ ...f, perplexityApiKey: e.target.value }))}
+                placeholder="pplx-••••••••"
+                data-testid="input-config-perplexity-key"
+              />
+            </div>
+          </div>
+
+          <Button
+            onClick={() => saveConfigMutation.mutate(configForm)}
+            disabled={saveConfigMutation.isPending}
+            className="w-full"
+            data-testid="button-save-config"
+          >
+            {saveConfigMutation.isPending ? "Enregistrement..." : "Sauvegarder"}
+          </Button>
+        </CardContent>
+      </Card>
 
       {/* Garmin Connection */}
       <Card data-testid="card-garmin-settings">
@@ -244,9 +352,11 @@ export default function SettingsPage() {
 
           <div className="p-3 rounded-lg bg-accent/30">
             <p className="text-xs text-muted-foreground leading-relaxed">
-              Connecte ton compte Strava pour importer automatiquement tes courses.
-              Les activités de type "Course" seront synchronisées avec les données
-              de distance, allure, fréquence cardiaque et dénivelé.
+              {!stravaStatus?.configured ? (
+                "Configure tes clés API Strava dans la section ci-dessus"
+              ) : (
+                "Connecte ton compte Strava pour importer automatiquement tes courses. Les activités de type \"Course\" seront synchronisées avec les données de distance, allure, fréquence cardiaque et dénivelé."
+              )}
             </p>
           </div>
         </CardContent>
